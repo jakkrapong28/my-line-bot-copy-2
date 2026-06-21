@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.DS_Store
+__pycache__/
+*.pyc
+venv/
+.venv/
+chroma_db_v5/
+bm25_cache_v5.joblib
+rerank_models/
+node_modules/
+*.md

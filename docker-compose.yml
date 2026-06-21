@@ -1,0 +1,42 @@
+services:
+  # Redis: cache, rate limiting and chat history (all-in-one)
+  redis:
+    image: redis:7-alpine
+    container_name: eneos_redis_v5
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ENEOS AI bot (FastAPI)
+  eneos_bot:
+    build: .
+    container_name: eneos_bot_v5
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Force connection to Redis via the compose service name
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      # Knowledge files can be updated without rebuilding the image
+      - ./knowledge:/app/knowledge
+      # Persist vector DB + BM25 cache across restarts
+      - ./chroma_db_v5:/app/chroma_db_v5
+      - ./bm25_cache_v5.joblib:/app/bm25_cache_v5.joblib
+      - ./rerank_models:/app/rerank_models
+    restart: always
+
+volumes:
+  redis_data:
