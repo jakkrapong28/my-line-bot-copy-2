@@ -1,4 +1,5 @@
 """Liveness / readiness endpoint."""
+
 from fastapi import APIRouter
 
 from ..config import settings
@@ -13,6 +14,6 @@ async def health():
     return {
         "status": "healthy" if rag.ready else "degraded",
         "version": settings.VERSION,
-        "redis": resources.redis_pool is not None,
+        "redis": resources.redis_connected,
         "knowledge_hash": rag.knowledge_hash[:8] if rag.knowledge_hash else "unknown",
     }

@@ -29,14 +29,16 @@ services:
     environment:
       # Force connection to Redis via the compose service name
       - REDIS_URL=redis://redis:6379/0
+      - DATA_DIR=/app/data
     volumes:
       # Knowledge files can be updated without rebuilding the image
       - ./knowledge:/app/knowledge
-      # Persist vector DB + BM25 cache across restarts
-      - ./chroma_db_v5:/app/chroma_db_v5
-      - ./bm25_cache_v5.joblib:/app/bm25_cache_v5.joblib
-      - ./rerank_models:/app/rerank_models
+      # Keep generated indexes/models outside the source tree. A named volume
+      # also avoids Docker creating bm25_cache_v5.joblib as a directory on a
+      # fresh clone.
+      - runtime_data:/app/data
     restart: always
 
 volumes:
   redis_data:
+  runtime_data:

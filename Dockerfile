@@ -17,6 +17,12 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY app/ ./app/
 COPY main.py ./
 
+# Run the public-facing API without root privileges.
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/data \
+    && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \

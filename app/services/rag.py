@@ -1,13 +1,16 @@
 """Hybrid (BM25 + vector) retrieval, reranking and the Groq-backed RAG chain."""
+
 import asyncio
 import gc
 import hashlib
 import re
 import shutil
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from flashrank import Ranker, RerankRequest
+from joblib import dump, load
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.retrievers import BM25Retriever
@@ -19,13 +22,12 @@ from langchain_core.retrievers import BaseRetriever
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from joblib import dump, load
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..classifier import DIRECT_ANSWERS, classifier
 from ..config import settings
 from ..logging_setup import cache_stats, logger
-from .redis_service import RedisService
+from .chat import ChatMessage
 
 SYSTEM_PROMPT = (
     'คุณคือ "พี่เอเนออส" ผู้เชี่ยวชาญผลิตภัณฑ์ ENEOS Thailand\n\n'
@@ -68,9 +70,9 @@ class HybridRetriever(BaseRetriever):
     bm25: BM25Retriever
     vector: BaseRetriever
 
-    def _get_relevant_documents(self, query: str) -> List[Document]:
-        scores: Dict[str, float] = {}
-        docs_by_key: Dict[str, Document] = {}
+    def _get_relevant_documents(self, query: str) -> list[Document]:
+        scores: dict[str, float] = {}
+        docs_by_key: dict[str, Document] = {}
         for ranked in (self.bm25.invoke(query), self.vector.invoke(query)):
             for rank, doc in enumerate(ranked):
                 key = doc.page_content
@@ -84,7 +86,7 @@ class RAGService:
     def __init__(self) -> None:
         self.llm_chain = None
         self.retriever = None
-        self.reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir=str(settings.rerank_models_dir))
+        self.reranker: Ranker | None = None
         self.ready = False
         self.sem = asyncio.Semaphore(settings.MAX_CONCURRENT_RAG)
         self.knowledge_hash = ""
@@ -97,7 +99,8 @@ class RAGService:
         except Exception as e:
             logger.critical("rag_init_failed", err=str(e), exc_info=True)
 
-    async def reload(self) -> Tuple[bool, str]:
+    async def reload(self) -> tuple[bool, str]:
+        was_ready = self.ready
         self.ready = False
         old_hash = self.knowledge_hash
         try:
@@ -105,15 +108,21 @@ class RAGService:
             self.ready = True
             return True, old_hash
         except Exception as e:
+            self.ready = was_ready
+            self.knowledge_hash = old_hash
             logger.critical("rag_reload_failed", err=str(e))
             return False, old_hash
 
     # ------------------------------------------------------------------ build
-    def _knowledge_files(self) -> List:
-        return [p for p in sorted(settings.knowledge_dir.glob("*.*")) if p.suffix.lower() in KNOWLEDGE_EXTS]
+    def _knowledge_files(self) -> list[Path]:
+        return [
+            p
+            for p in sorted(settings.knowledge_dir.glob("*.*"))
+            if p.suffix.lower() in KNOWLEDGE_EXTS
+        ]
 
-    def _load_docs(self) -> List[Document]:
-        docs: List[Document] = []
+    def _load_docs(self) -> list[Document]:
+        docs: list[Document] = []
         for p in self._knowledge_files():
             if p.stat().st_size > settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024:
                 continue
@@ -122,7 +131,9 @@ class RAGService:
                 if suffix == ".pdf":
                     docs.extend(PyPDFLoader(str(p)).load())
                 elif suffix in (".txt", ".md"):
-                    text = re.sub(r"\[cite_start\]|\[cite:\s*\d+\]", "", p.read_text(encoding="utf-8"))
+                    text = re.sub(
+                        r"\[cite_start\]|\[cite:\s*\d+\]", "", p.read_text(encoding="utf-8")
+                    )
                     docs.append(Document(page_content=text, metadata={"source": p.name}))
                 elif suffix == ".xlsx":
                     df = pd.read_excel(p)
@@ -133,14 +144,24 @@ class RAGService:
                             if pd.notna(val) and str(val).strip() not in ("", "nan")
                         ]
                         if parts:
-                            docs.append(Document(page_content=" | ".join(parts), metadata={"source": p.name}))
+                            docs.append(
+                                Document(
+                                    page_content=" | ".join(parts), metadata={"source": p.name}
+                                )
+                            )
             except Exception as e:
                 logger.warning("file_load_error", file=p.name, err=str(e))
         return docs
 
     def _compute_hash(self) -> str:
-        parts = [f"{f.name}:{f.stat().st_mtime:.0f}:{f.stat().st_size}" for f in self._knowledge_files()]
-        return hashlib.sha256("|".join(parts).encode()).hexdigest() if parts else "empty"
+        digest = hashlib.sha256()
+        files = self._knowledge_files()
+        for path in files:
+            digest.update(path.name.encode("utf-8"))
+            with path.open("rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+        return digest.hexdigest() if files else "empty"
 
     def _build(self) -> None:
         cur_hash = self._compute_hash()
@@ -148,7 +169,12 @@ class RAGService:
 
         hash_file = settings.chroma_path / "hash.txt"
         stored = hash_file.read_text().strip() if hash_file.exists() else ""
-        need_build = settings.FORCE_REBUILD_DB or cur_hash != stored or not settings.chroma_path.exists()
+        need_build = (
+            settings.FORCE_REBUILD_DB
+            or cur_hash != stored
+            or not settings.chroma_path.exists()
+            or not settings.bm25_cache_path.is_file()
+        )
 
         raw_docs = self._load_docs()
         if not raw_docs:
@@ -164,6 +190,11 @@ class RAGService:
             chunk_overlap=settings.CHUNK_OVERLAP,
             separators=["--------------------", "\n\n", "\n", " "],
         )
+        if self.reranker is None:
+            self.reranker = Ranker(
+                model_name="ms-marco-MiniLM-L-12-v2",
+                cache_dir=str(settings.rerank_models_dir),
+            )
 
         if need_build:
             if settings.chroma_path.exists():
@@ -171,16 +202,21 @@ class RAGService:
             settings.chroma_path.mkdir(parents=True, exist_ok=True)
             chunks = splitter.split_documents(raw_docs)
             vectordb = Chroma.from_documents(
-                chunks, embed, collection_name="eneos_v5", persist_directory=str(settings.chroma_path)
+                chunks,
+                embed,
+                collection_name="eneos_v5",
+                persist_directory=str(settings.chroma_path),
             )
             bm25 = BM25Retriever.from_documents(chunks)
             bm25.k = settings.RETRIEVER_K
             dump(bm25, settings.bm25_cache_path)
-            hash_file.write_text(cur_hash)
+            hash_file.write_text(cur_hash, encoding="utf-8")
             del chunks
         else:
             vectordb = Chroma(
-                collection_name="eneos_v5", embedding_function=embed, persist_directory=str(settings.chroma_path)
+                collection_name="eneos_v5",
+                embedding_function=embed,
+                persist_directory=str(settings.chroma_path),
             )
             bm25 = load(settings.bm25_cache_path)
 
@@ -199,10 +235,12 @@ class RAGService:
 
     # ------------------------------------------------------------------- ask
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    async def _llm(self, payload: dict) -> str:
+    async def _llm(self, payload: dict[str, Any]) -> str:
+        if self.llm_chain is None:
+            raise RuntimeError("RAG service is not initialized")
         return await self.llm_chain.ainvoke(payload)
 
-    async def ask(self, question: str, history: List[Dict], redis_svc: RedisService, user_id: str) -> str:
+    async def ask(self, question: str, history: list[ChatMessage]) -> str:
         if not self.ready:
             return "ระบบกำลังอัปเดตข้อมูล กรุณารอสักครู่นะครับ"
 
@@ -221,20 +259,33 @@ class RAGService:
         if not docs:
             return "คำถามนี้เฉพาะเจาะจงมากครับ พี่เอเนออสขอส่งต่อให้เจ้าหน้าที่ผู้เชี่ยวชาญดูแลต่อนะครับ"
 
+        if self.reranker is None:
+            raise RuntimeError("RAG service is not initialized")
         results = await asyncio.to_thread(
             self.reranker.rerank,
             RerankRequest(
                 query=question,
-                passages=[{"id": str(i), "text": d.page_content, "meta": d.metadata} for i, d in enumerate(docs)],
+                passages=[
+                    {"id": str(i), "text": d.page_content, "meta": d.metadata}
+                    for i, d in enumerate(docs)
+                ],
             ),
         )
 
-        final_docs = [r["text"] for r in results[: settings.RERANK_TOP_K] if r["score"] >= settings.RERANK_HARD_CUTOFF]
+        final_docs = [
+            r["text"]
+            for r in results[: settings.RERANK_TOP_K]
+            if r["score"] >= settings.RERANK_HARD_CUTOFF
+        ]
+        if not final_docs:
+            return "คำถามนี้มีความเฉพาะเจาะจงสูงครับ พี่เอเนออสขอส่งต่อให้เจ้าหน้าที่ดูแลต่อนะครับ"
 
         async with self.sem:
             context = classifier.compress("\n\n---\n\n".join(final_docs))
             msgs = [
-                HumanMessage(content=m["content"]) if m.get("role") == "user" else AIMessage(content=m["content"])
+                HumanMessage(content=m["content"])
+                if m.get("role") == "user"
+                else AIMessage(content=m["content"])
                 for m in history
             ]
 
@@ -253,13 +304,6 @@ class RAGService:
             if not answer.endswith("ครับ"):
                 answer += " ครับ"
 
-            await redis_svc.append_history(
-                user_id,
-                [
-                    {"role": "user", "content": question},
-                    {"role": "assistant", "content": answer},
-                ],
-            )
             return answer
 
 

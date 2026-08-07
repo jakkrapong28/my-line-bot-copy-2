@@ -1,6 +1,6 @@
 """Application configuration loaded from environment / .env."""
+
 from pathlib import Path
-from typing import List
 
 from pydantic import Field, SecretStr, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -29,9 +29,10 @@ class Settings(BaseSettings):
     ADMIN_JWT_SECRET: SecretStr = Field(...)
 
     REDIS_URL: str = "redis://localhost:6379/0"
+    DATA_DIR: Path = BASE_DIR
 
     # --- CORS ---
-    CORS_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
+    CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["*"])
 
     # --- Runtime limits ---
     MAX_CONCURRENT_RAG: int = 5
@@ -61,18 +62,19 @@ class Settings(BaseSettings):
     @computed_field
     @property
     def chroma_path(self) -> Path:
-        return BASE_DIR / "chroma_db_v5"
+        return self.DATA_DIR / "chroma_db_v5"
 
     @computed_field
     @property
     def bm25_cache_path(self) -> Path:
-        return BASE_DIR / "bm25_cache_v5.joblib"
+        return self.DATA_DIR / "bm25_cache_v5.joblib"
 
     @computed_field
     @property
     def rerank_models_dir(self) -> Path:
-        return BASE_DIR / "rerank_models"
+        return self.DATA_DIR / "rerank_models"
 
 
 settings = Settings()
 settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
+settings.DATA_DIR.mkdir(parents=True, exist_ok=True)

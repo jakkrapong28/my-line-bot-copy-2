@@ -7,3 +7,6 @@ venv/
 chroma_db_v5/
 bm25_cache_v5.joblib
 rerank_models/
+.coverage
+.pytest_cache/
+.ruff_cache/

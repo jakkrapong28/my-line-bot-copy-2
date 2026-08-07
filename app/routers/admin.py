@@ -1,4 +1,5 @@
 """Admin API: login, knowledge reload and cache stats (JWT protected)."""
+
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException

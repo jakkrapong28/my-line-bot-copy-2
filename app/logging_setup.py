@@ -1,4 +1,5 @@
 """Structured logging and in-process cache statistics."""
+
 import structlog
 
 from .config import settings

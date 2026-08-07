@@ -1,13 +1,13 @@
 """Shared mutable runtime state (connection pools + Redis circuit breaker)."""
-from typing import Optional
 
 import httpx
 import redis.asyncio as redis
 
 
 class Resources:
-    redis_pool: Optional[redis.Redis] = None
-    http_client: Optional[httpx.AsyncClient] = None
+    redis_pool: redis.Redis | None = None
+    http_client: httpx.AsyncClient | None = None
+    redis_connected: bool = False
     # Redis circuit breaker
     redis_last_failure: float = 0.0
     redis_failure_count: int = 0

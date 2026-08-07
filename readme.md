@@ -58,8 +58,9 @@ app/
 ├── state.py               # connection pools + Redis circuit breaker
 ├── classifier.py          # QuestionClassifier + canned/direct answers
 ├── security.py            # JWT login / verify
-├── deps.py                # FastAPI dependencies (rate limit, cache key)
+├── deps.py                # FastAPI dependencies (rate limit)
 ├── services/
+│   ├── chat.py            # conversation orchestration · context-safe cache
 │   ├── redis_service.py   # cache · rate limit · chat history
 │   └── rag.py             # Hybrid retriever (RRF) · rerank · LLM chain
 ├── routers/
@@ -86,6 +87,9 @@ cp .env.example .env        # แล้วกรอกค่าให้คร�
 docker compose up --build   # รัน redis + bot พร้อมกัน
 ```
 
+การรันครั้งแรกจะดาวน์โหลด embedding/reranker models และสร้างดัชนีใน Docker named volume
+จึงอาจใช้เวลาหลายนาที; รอบถัดไปจะใช้ข้อมูลที่ persist ไว้
+
 ### วิธีที่ 2 — รันตรง
 
 ```bash
@@ -94,6 +98,19 @@ pip install -r requirements.txt
 # วาง knowledge files (.pdf/.xlsx/.txt/.md) ใน knowledge/
 python main.py              # http://localhost:8000
 ```
+
+### ตรวจสอบคุณภาพโค้ด
+
+ชุด unit tests ไม่เรียก Redis, Groq หรือดาวน์โหลดโมเดล จึงรันได้เร็วและ deterministic:
+
+```bash
+python -m unittest discover -v
+pip install -r requirements-dev.txt
+ruff check app tests main.py
+ruff format --check app tests main.py
+```
+
+GitHub Actions จะรันทั้ง lint, format check และ unit tests อัตโนมัติทุก push/PR
 
 ### ตัวแปร .env
 
@@ -107,6 +124,7 @@ ADMIN_JWT_SECRET=        # ใช้สตริงสุ่มยาว ๆ
 
 # ออปชัน
 REDIS_URL=redis://localhost:6379/0
+DATA_DIR=.                  # ที่เก็บ generated indexes/models
 DEBUG=false
 FORCE_REBUILD_DB=false
 # CORS_ORIGINS=["https://your-frontend.com"]   # อย่าใช้ "*" บน production

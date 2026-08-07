@@ -2,12 +2,14 @@
 
 ENEOS AI v5.3 — Groq Llama-3.3-70b · Redis · Hybrid RAG · JWT admin.
 """
+
 from contextlib import asynccontextmanager
 
 import httpx
 import redis.asyncio as redis
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from redis.exceptions import RedisError
 
 from .config import settings
 from .logging_setup import logger
@@ -29,7 +31,15 @@ async def lifespan(app: FastAPI):
     )
     try:
         await resources.redis_pool.ping()
+        resources.redis_connected = True
         logger.info("redis_connected")
+    except RedisError as exc:
+        # Cache, history and rate limiting are designed to fail open. Keeping
+        # the API alive also makes it possible to recover when Redis returns.
+        resources.redis_connected = False
+        logger.warning("redis_unavailable_at_startup", err=str(exc))
+
+    try:
         await rag.initialize()
         yield
     finally:
@@ -38,6 +48,9 @@ async def lifespan(app: FastAPI):
             await resources.http_client.aclose()
         if resources.redis_pool:
             await resources.redis_pool.aclose()
+        resources.http_client = None
+        resources.redis_pool = None
+        resources.redis_connected = False
 
 
 def create_app() -> FastAPI:

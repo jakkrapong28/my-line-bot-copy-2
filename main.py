@@ -3,7 +3,10 @@
 The application is implemented as a package under ``app/``. This module just
 re-exports the ASGI app and provides a local ``python main.py`` runner.
 """
+
 from app.main import app
+
+__all__ = ["app"]
 
 if __name__ == "__main__":
     import uvicorn

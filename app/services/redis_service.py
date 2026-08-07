@@ -4,9 +4,11 @@ All Redis access goes through ``_safe`` which implements a simple circuit
 breaker so that a Redis outage degrades gracefully instead of taking the
 whole bot down.
 """
+
 import json
 import time
-from typing import Awaitable, Dict, List, Optional
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 import redis.asyncio as redis
 from fastapi import HTTPException
@@ -16,12 +18,15 @@ from ..config import settings
 from ..logging_setup import cache_stats, logger
 from ..state import resources
 
+T = TypeVar("T")
+
 
 class RedisService:
     def __init__(self, client: redis.Redis):
         self.client = client
 
-    async def _safe(self, coro: Awaitable):
+    async def _safe(self, operation: Callable[[], Awaitable[T]]) -> T | None:
+        """Run a lazily-created Redis operation behind the circuit breaker."""
         now = time.time()
         if (
             resources.redis_failure_count >= 3
@@ -29,12 +34,14 @@ class RedisService:
         ):
             return None
         try:
-            result = await coro
+            result = await operation()
             resources.redis_failure_count = 0
+            resources.redis_connected = True
             return result
         except RedisError as e:
             resources.redis_failure_count += 1
             resources.redis_last_failure = time.time()
+            resources.redis_connected = False
             logger.error("redis_error", err=str(e))
             return None
 
@@ -49,11 +56,11 @@ class RedisService:
                 return r[0] <= settings.RATE_LIMIT_PER_MINUTE
 
         # Fail open: if Redis is unavailable we allow the request.
-        result = await self._safe(_op())
+        result = await self._safe(_op)
         return True if result is None else result
 
-    async def get_cache(self, key: str) -> Optional[str]:
-        val = await self._safe(self.client.get(key))
+    async def get_cache(self, key: str) -> str | None:
+        val = await self._safe(lambda: self.client.get(key))
         if val:
             cache_stats.hits += 1
         else:
@@ -61,7 +68,7 @@ class RedisService:
         return val
 
     async def set_cache(self, key: str, value: str) -> None:
-        await self._safe(self.client.setex(key, settings.CACHE_TTL_SECONDS, value))
+        await self._safe(lambda: self.client.setex(key, settings.CACHE_TTL_SECONDS, value))
 
     async def purge_cache_by_prefix(self, prefix: str) -> int:
         cursor, deleted = 0, 0
@@ -78,19 +85,25 @@ class RedisService:
             logger.warning("cache_purge_failed", err=str(e))
         return deleted
 
-    async def get_history(self, user_id: str) -> List[Dict]:
+    async def get_history(self, user_id: str) -> list[dict[str, Any]]:
         key = f"hist:{user_id}"
-        data = await self._safe(self.client.get(key))
-        return json.loads(data) if data else []
+        data = await self._safe(lambda: self.client.get(key))
+        if not data:
+            return []
+        try:
+            history = json.loads(data)
+            return history if isinstance(history, list) else []
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("invalid_chat_history", user_id=user_id)
+            return []
 
-    async def append_history(self, user_id: str, new_msgs: List[Dict]) -> None:
+    async def append_history(self, user_id: str, new_msgs: list[dict[str, Any]]) -> None:
         key = f"hist:{user_id}"
         hist = await self.get_history(user_id)
         hist.extend(new_msgs)
-        hist = hist[-settings.MAX_HISTORY_MESSAGES:]
-        await self._safe(
-            self.client.setex(key, settings.HISTORY_TTL_SECONDS, json.dumps(hist, ensure_ascii=False))
-        )
+        hist = hist[-settings.MAX_HISTORY_MESSAGES :]
+        payload = json.dumps(hist, ensure_ascii=False)
+        await self._safe(lambda: self.client.setex(key, settings.HISTORY_TTL_SECONDS, payload))
 
 
 async def get_redis_svc() -> RedisService:
